@@ -1,6 +1,8 @@
 from dotenv import load_dotenv
-load_dotenv(override=True)
+load_dotenv()
 import asyncio
+import base64, logging
+from mimetypes import guess_type
 import chainlit as cl
 from google.adk.agents import Agent
 from google.adk.runners import Runner
@@ -9,6 +11,7 @@ from google.adk.tools import google_search
 from google.genai import types  # for message content structure
 from google.adk.agents.run_config import RunConfig, StreamingMode
 import os
+
 
 # 1. Define the Vertex AI agent with Google Search tool:
 agent = Agent(
@@ -54,22 +57,40 @@ async def on_chat_start():
     cl.user_session.set("adk_user_id", user_id)
     cl.user_session.set("adk_session_id", session_id)
 
-# 5. Handle incoming user messages and get agent responses:
+
 @cl.on_message
 async def handle(message: cl.Message):
+    # ---- session guard -------------------------------------------------
     user_id    = cl.user_session.get("adk_user_id")
     session_id = cl.user_session.get("adk_session_id")
-
     if not (user_id and session_id):
-        await cl.Message(
-            content="⚠️ Internal error: ADK session was not initialised."
-        ).send()
+        await cl.Message("⚠️ Internal error: ADK session was not initialised.").send()
         return
+    # --------------------------------------------------------------------
 
-    user_query = message.content
-    content = types.Content(role="user", parts=[types.Part(text=user_query)])
+    # ---- build Gemini parts -------------------------------------------
+    parts: list[types.Part] = [types.Part(text=message.content or "")]
+    for elem in (message.elements or []):
+        with open(elem.path, "rb") as fp:
+            raw = fp.read()
 
-    # empty shell we’ll update incrementally
+        mime = elem.mime or guess_type(elem.name)[0] or "application/octet-stream"
+        if mime.startswith("text/") or mime in {"application/json", "application/xml"}:
+            parts.append(types.Part(text=raw.decode("utf-8", "ignore")))
+        else:
+            parts.append(
+                types.Part(
+                    inline_data=types.Blob(
+                        mime_type=mime,
+                        data=base64.b64encode(raw).decode(),
+                    )
+                )
+            )
+
+    content = types.Content(role="user", parts=parts)
+    # --------------------------------------------------------------------
+
+
     stream_msg = cl.Message(content="")
     await stream_msg.send()
 
@@ -81,10 +102,13 @@ async def handle(message: cl.Message):
     ):
         if event.content and event.content.parts:
             chunk = "".join(p.text for p in event.content.parts)
-            stream_msg.content += chunk
-            await stream_msg.update()   # live push to UI
+            if not stream_msg.content.endswith(chunk):
+                stream_msg.content += chunk
+                print('stream message:', stream_msg)
+                await stream_msg.update()
 
-    await stream_msg.update()
+    # --------------------------------------------------------------------
+
 
 
 print("GOOGLE_CLOUD_PROJECT:", os.getenv("GOOGLE_CLOUD_PROJECT"))
